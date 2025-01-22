@@ -79,6 +79,7 @@ class Pico:
                     try:
                         value = re.search("setpoint_([0-9]*.[0-9]*)",latest_input_line).group(1)
                         self.setpoint = float(value)
+                        self.pid = PID(Kp=-5000, Ki=-4000, Kd=-4000, setpoint=self.setpoint, sample_time=500,output_limits=[4000, 64_000] , scale='ms')
                         print(f"Setpoint updated to: {value}")
                     except:
                         print(f"Can not parse setpoint, message was: {latest_input_line}")

@@ -27,6 +27,9 @@ import serial
 import sys
 import time
 import itertools
+from tqdm import tqdm
+
+
 
 today = datetime.today().strftime('%Y%m%d')[2:]
 
@@ -77,6 +80,7 @@ def findDevice(question="hello", answer="", flush=True, timeout=1):
     """
     Attempts to find a device on any available serial port by sending 
     a 'question' string and looking for an 'answer' substring in the response.
+    If no matching device is found on any port, implicitly return None
 
     :param question: The message to send to the device (default: "hello").
     :param answer: The substring we expect in the device's response (default: "").
@@ -104,53 +108,255 @@ def findDevice(question="hello", answer="", flush=True, timeout=1):
             if answer in msg:
                 print(f"Found device at: {port}, answer: {msg}")
                 return port
-    # If no matching device is found on any port, implicitly return None
-    
+       
 
+def gen_cmd_arr_line(num: int, freq: int, actinic: int) -> list:
+    """
+    Generate a single command-array entry of 8 parameters.
+        
+    :param num: Total number of measurement points (10-2_000).
+    :param freq: Frequency measurement points (1-200).
+    :param actinic: Actinic light setting (0-255).
+    :return: List of 8 integer values representing the command.
+    """
+    return [
+        2,              # Fixed flag or identifier
+        0,              # Another fixed flag or placeholder
+        num // 256,     # High byte of 'num'
+        num % 256,      # Low byte of 'num'
+        freq // 256,    # High byte of 'freq'
+        freq % 256,     # Low byte of 'freq'
+        actinic,        # Actinic light parameter
+        1               # Fixed flag or terminator
+    ]
 
+def calc_arr_param(cmd: list, persist: bool = False):
+    """
+    Reshape a flat command list into a 2D array, construct a command string,
+    and calculate measurement timelines and actinic-array values.
 
+    :param cmd: A 1D list of length 8*N (multiple commands concatenated).
+    :param persist: A flag indicating whether the command persists after completion.
+    :return: Tuple (cmd_str, mea_tml, mea_act)
+        - cmd_str: Formatted command string (e.g., for sending over serial).
+        - mea_tml: NumPy array of timestamps (scaled by 0.854).
+        - mea_act: List of actinic values (one per timestamp).
+    """
+    # Reshape 'cmd' into an N x 8 array
+    cmd_arr = np.reshape(cmd, (-1, 8))
+    arr_length = cmd_arr.shape[0]
 
+    # Create a comma-separated command string:
+    # e.g., "arrun1,N,persist,<entire cmd list>,\n"
+    cmd_str = f"arrun1,{arr_length},{persist},{str(cmd)[1:-1]},\n"
+    cmd_str = cmd_str.replace(" ", "")  # Remove spaces for a cleaner command
 
-def do_PIDcommand(PORT,string):
-    with serial.Serial(PORT, baudrate=115200, timeout = 1) as ser:
-        # ser.setRTS(False)
-        ser.write(f"{string}\n".encode())
+    # Parse the reshaped array into usable parameters
+    num_pts = cmd_arr[:, 2] * 256 + cmd_arr[:, 3]  # Number of points (high/low bytes)
+    act_arr = cmd_arr[:, 6]                       # Actinic setting
+    mea_feq = 1 / (cmd_arr[:, 4] * 256 + cmd_arr[:, 5])  # Measurement frequency (1 / freq)
+
+    # Build up the measurement timeline and actinic values
+    _t = 0
+    mea_tml = []
+    mea_act = []
+
+    # For each command segment, create a timeline and corresponding actinic values
+    for _n, _f, _a in zip(num_pts, mea_feq, act_arr):
+        segment_times = (np.arange(_n) * _f) + _t
+        mea_tml.extend(segment_times)       # Accumulate times
+        mea_act.extend([_a] * _n)           # Repeat actinic value _n times
+        _t = segment_times[-1]              # Update the offset for the next segment
+
+    # Scale the entire timeline by 0.854
+    mea_tml = np.array(mea_tml) * 0.854
+
+    return cmd_str, mea_tml, mea_act
+
+def send_read_comand(PORT,string,baudrate=115200, timeout=10):
+    """
+    Function to open serial, get in master mode with "hello" comand and send comand.
+    Read will stop when no more line to be read.
+    Args:
+        port: str, port name
+        baudrate: int, baudrate
+        timeout: int, timeout in seconds
+    Returns:
+        list, received data
+    """
+
+    with serial.Serial(PORT, baudrate = baudrate, timeout = timeout) as ser:
+        ser.setRTS(False)
+        ser.flush() # Flush 
+        time.sleep(0.7)
+        ser.write("hello\n".encode())
         time.sleep(0.5)
-        msg = ser.readline().decode()
-        response = []
-        while msg:
-            response.append(msg)
-            msg = ser.readline().decode()
-            
-        return response
+        ser.write(f"{string}\n".encode())
+        lines = []
+        try:
+            while True:
+                line = ser.readline() # Attempt to read one line
+                if not line:    # If nothing was read (empty line), we assume there's no more data for now
+                    break
+                lines.append(line.decode('utf-8', errors='replace').rstrip()) # Convert bytes to string and strip trailing whitespace
+        except:
+            pass
+    return lines
+
+
+
+def parse_command_blocks(lines, cmd_prefix="cmd:"):
+    """
+    Parse a list of lines and group them by commands that match `cmd_prefix`.
+
+    The function identifies lines containing commands (e.g., 'cmd: something')
+    and collects all subsequent lines into that command's "block" until the
+    next command (or end of list).
+
+    :param lines: List of strings to parse.
+    :param cmd_prefix: The prefix that indicates a new command. Defaults to 'cmd:'.
+    :return: A dictionary mapping { command_name: [list_of_lines_until_next_command] }
+             If the same command appears multiple times, each occurrence will
+             overwrite previous data unless modified to handle duplicates.
+    """
+    command_dict = {}
+    current_cmd = None
+    current_data = []
+
+    for line in lines:
+        # Try to find a line that includes 'cmd:' (possibly with extra characters).
+        # The regex captures whatever follows 'cmd:' up to the first whitespace 
+        # or end of string. E.g., 'cmd: hello' => group(1) = 'hello'.
+        match = re.search(r'cmd:\s*([^\s]+)', line)
+
+        if match:
+            # If we have a "current_cmd", store its accumulated data first
+            if current_cmd is not None:
+                command_dict[current_cmd] = current_data
+
+            # Extract the new command from the current line
+            current_cmd = match.group(1)
+            current_data = []  # Start a fresh list for data following this command
+        else:
+            # If this line does not declare a new command, and we've already seen a command,
+            # then add the line to the current command's block
+            if current_cmd is not None:
+                current_data.append(line)
+
+    # At the end, if there is a command in progress, save its data
+    if current_cmd is not None:
+        command_dict[current_cmd] = current_data
+
+    return command_dict
+
+
+def parse_arrun1(command_dict):
+    """
+    From a parsed dictionary (use parse_command_block() ), locate the block after 'cmd: arrun1'
+    and extract numeric values of T, F, S, R, Sun, and L for each
+    matching line, returning them in a dictionary of lists.
+
+    Example return structure:
+    {
+      'T':   [31.0, 31.0, 31.0],
+      'F':   [0.0759, 0.0748, 0.0762],
+      'S':   [506, 499, 509],
+      'R':   [6667, 6669, 6678],
+      'Sun': [380, 382, 380],
+      'L':   [484, 486, 487]
+    }
+
+    :param lines: A list of text lines (e.g., from a serial device).
+    :return: A dict of lists, one list per key: 'T', 'F', 'S', 'R', 'Sun', 'L'.
+             If 'cmd: arrun1' or matching lines are not found, returns
+             empty lists for each key.
+    """
+    # 1) Extract lines that belong to "arrun1"
+    arrun1_lines = command_dict.get("arrun1", [])
+
+    # 2) Prepare a regex to capture the six fields of interest
+    pattern = re.compile(
+        r"T:([^,]+),F:([^,]+),S:([^,]+),R:([^,]+),Sun:([^,]+),L:([^,]+)"
+    )
+
+    # 4) Initialize an output dict with empty lists for each key
+    result = {"T": [],"F": [],"S": [],"R": [],"Sun": [],"L": [] }
+
+    for line in arrun1_lines:
+        match = pattern.search(line)
+        if match:
+            # Convert T, F to float and S, R, Sun, L to int
+            try:
+                t_val = float(match.group(1))
+                f_val = float(match.group(2))
+                s_val = int(match.group(3))
+                r_val = int(match.group(4))
+                sun_val = int(match.group(5))
+                l_val = int(match.group(6))
+
+                # Append to the lists
+                result["T"].append(t_val)
+                result["F"].append(f_val)
+                result["S"].append(s_val)
+                result["R"].append(r_val)
+                result["Sun"].append(sun_val)
+                result["L"].append(l_val)
+            except ValueError:
+                # If conversion fails (malformed line), ignore or handle it
+                print(f"PARSING ERROR parse_arrun1_dict, {match}")
+                pass
+
+    return result
+
+
+def plot_two_values(r_data,title=""):
     
+    fig, ax1 = plt.subplots()
+    
+    color_f = 'tab:blue'
+    ax1.set_xlabel('Measurement Index')
+    ax1.set_ylabel('Fluo', color=color_f)
+    line1 = ax1.plot(
+        np.arange(len(r_data["F"])), 
+        r_data["F"], 
+        color=color_f, 
+        label="Fluo"
+    )
+    # Match y-axis tick label color to the line color
+    ax1.tick_params(axis='y', labelcolor=color_f)
+    ax1.set_ylim([0.1,0.15])
+    
+    # 3) Create a secondary y-axis sharing the same x-axis
+    ax2 = ax1.twinx()
+    
+    # 4) Plot the second data series on the secondary y-axis
+    color_r = 'tab:red'
+    ax2.set_ylabel('Reflectance', color=color_r)
+    line2 = ax2.plot(
+        np.arange(len(r_data["R"])), 
+        r_data["R"], 
+        color=color_r, 
+        label="Reflectance"
+    )
+    ax2.tick_params(axis='y', labelcolor=color_r)
+    ax2.set_ylim([6300,6900])
+    
+    # (Optional) Combine legends from both axes
+    # Matplotlib won't automatically merge them if you use separate axes, so do this:
+    lines = line1 + line2
+    labels = [l.get_label() for l in lines]
+    ax1.legend(lines, labels, loc="best")
+    
+    
+    plt.title(title)
+    fig.tight_layout()  # Helps prevent overlapping labels on most backends
+    plt.show() 
 
 
-# def parse_response(response):
-#     a = ''.join(map(str, response)).replace("\n","")
-#     a = re.search(r"data:\[(.*)\]",a).group(1)
-#     a = a.split(",")
-#     a = [float(x) for x in a]
-#     a = [int(x) for x in a]
-#     return a
-
-# def response_json(response):
-#     import json
-#     s = ''.join(map(str, response)).replace("\n","")[:-8]
-#     j = json.loads(s)
-#     return j
 
 
 
 
-# for port in serial_ports():
-#     with serial.Serial(port, baudrate=115200, timeout = 2) as ser:
-#         ser.write("hello\n".encode())
-#         answer = ser.readline().decode()
-#         while answer:
-#             print(answer)
-#             answer = ser.readline().decode()
-            
 
 
 
@@ -161,36 +367,110 @@ assert PORT_AMB != None
 assert PORT_PID != None
 
 
-# # a = "".join(do_PIDcommand(PORT_PID,"setpoint_23.3"))
 
-# # b = "".join(do_PIDcommand(PORT_PID,"query"))
-
-
-RANGE_TEMP = [21,22]   # range of temperature 
-REP = 2
-STABILIZE =  60*10         # seconds 
+RANGE_TEMP = [20,25,30,35,30,25,20,35,20]   # range of temperature 
+STABILIZE =  60                 # wait time after reaching setpoint, seconds 
 OUTDIR = f"../../../Data/ambit/{today}/" # output directory
-SAVE = True
+SAVE = True # True for saving json with data
+INPUT = True # True for adding sample
+myinput = "" # create string for sample
+
+cmd = []
+cmd += gen_cmd_arr_line(num = 20, freq = 10, actinic = 0)
+cmd += gen_cmd_arr_line(num = 20, freq = 10, actinic = 200)
+cmd += gen_cmd_arr_line(num = 20, freq = 10, actinic = 0)
+cmd_str, timeline, act_arr = calc_arr_param(cmd, 0)
+
+
+
 
 if SAVE:
     ensure_path_exists(OUTDIR)
+if INPUT:
+    myinput = input("\nInsert type of sample (eg. unicode, blank...)\n")
+    
    
+for TEMP_VALUE in RANGE_TEMP:  
+    setpoint_command = f"setpoint_{TEMP_VALUE}" # Construct the command to set the device's temperature setpoint
+    with serial.Serial(PORT_PID, baudrate=115200, timeout=1) as ser: # Open a serial connection to the PID controller
+        print(f"Setting setpoint to {TEMP_VALUE}")  # Let the user know we are changing the setpoint
+        ser.write(f"{setpoint_command}\n".encode()) # Send the setpoint command, followed by a newline to conform to typical serial protocols
+        time.sleep(1) # Wait briefly to allow the device time to process the command
+        msg = ser.readline().decode().strip()       # (Optional) Read and print the immediate response after setting the setpoint
+        print(f"Initial response: {msg}")
+        
+        while True:   # Continuously poll the device to see if the measured temperature has reached our setpoint
+            ser.write("query\n".encode())          # Send a "query" command to the device to get the current status
+            msg = ser.readline().decode().strip()  # Read the response line, decode it to string, and strip whitespace
+            print(f"Query response: {msg}")
+            if msg:
+                try:
+                    # Parse the setpoint, measured temperature, and PID feedback using regular expressions
+                    setpoint_match = re.search(r"Setpoint:\s*([0-9]*\.[0-9]*),", msg)
+                    measured_match = re.search(r"Measured temp:\s*([0-9]*\.[0-9]*)", msg)
+                    pwm_match = re.search(r"PID feedback:\s*([0-9]*)", msg)
+                    # Extract each value if the above searches are successful, store as float and int
+                    setpoint = float(setpoint_match.group(1))
+                    measured = float(measured_match.group(1))
+                    pwm = int(pwm_match.group(1))  
+                    print(f"READING => Setpoint: {setpoint}, Measured: {measured}, PWM: {pwm}")
+                    # If the measured temperature is close enough to the setpoint, break out of the loop
+                    if abs(measured - setpoint) < 0.5:
+                        print("Setpoint reached, stabilizing.")
+                        for _ in tqdm(range(STABILIZE), desc="Loading"):
+                            time.sleep(1)
+                        print("Temperature is stable. READY to proceed.")
+                        
+                        break
+                except (AttributeError, ValueError):
+                    print(f"FAILED to parse the response: {msg}") # If the regex did not match or casting failed, print an error message
+                    # # Short delay before trying again
+                    time.sleep(0.5)
+            else:
+                # If no meaningful response is received, just log it and continue looping
+                print(f"UNPARSABLE or empty message: {msg}")
+            
+            # Small delay to avoid spamming the device with too many queries
+            time.sleep(0.5)   
+            
+        
+        print("\n\nMeasuring temperature")
+        t_serial = send_read_comand(PORT_AMB,"temp",timeout=1)
+        t_parsed = parse_command_blocks(t_serial) 
+        t_obj, t_board, _ = t_parsed["temp"][0].split("\t") # extract t object, t board
+        print("Running protocol")
+        r_serial = send_read_comand(PORT_AMB,cmd_str,timeout=1)
+        r_parsed = parse_command_blocks(r_serial)
+        r_data = parse_arrun1(r_parsed)
+        
+        # setup results dictionary
+        metadata = {} # setup results dictionary
+        metadata["datetime"] = today
+        metadata["time"] = datetime.now().strftime("%H:%M:%S")
+        metadata["sample"] = myinput
+        metadata["t_setpoint"] = setpoint
+        metadata["t_stabilization"] = STABILIZE
+        metadata["t_obj"] = t_obj
+        metadata["t_board"] = t_board
+        metadata["cmd_str"] = cmd_str
+        results = metadata | r_data
+        
+        if SAVE:
+            FIDX = "{:04d}".format(len(os.listdir(OUTDIR)))
+            filename = f"{today}_{FIDX}_Ambit.json"
+            print(f"Saving as {OUTDIR+filename}")
+            with open(OUTDIR+filename, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=4)
+            
+        
+        plot_two_values(r_data,title=TEMP_VALUE)
+        # print(data)
     
    
     
    
     
-   
-    
-   
-    
-   
-    
-   
-    
-   
-    
-   
+
     
    
     
@@ -247,14 +527,74 @@ if SAVE:
 
 
 
+# def do_PIDcommand(PORT,string):
+#     with serial.Serial(PORT, baudrate=115200, timeout = 1) as ser:
+#         # ser.setRTS(False)
+#         ser.write(f"{string}\n".encode())
+#         time.sleep(0.5)
+#         msg = ser.readline().decode()
+#         response = []
+#         while msg:
+#             response.append(msg)
+#             msg = ser.readline().decode()
+            
+#         return response
 
 
+# def parse_response(response):
+#     a = ''.join(map(str, response)).replace("\n","")
+#     a = re.search(r"data:\[(.*)\]",a).group(1)
+#     a = a.split(",")
+#     a = [float(x) for x in a]
+#     a = [int(x) for x in a]
+#     return a
+
+# def response_json(response):
+#     import json
+#     s = ''.join(map(str, response)).replace("\n","")[:-8]
+#     j = json.loads(s)
+#     return j
 
 
+# for port in serial_ports():
+#     with serial.Serial(port, baudrate=115200, timeout = 2) as ser:
+#         ser.write("hello\n".encode())
+#         answer = ser.readline().decode()
+#         while answer:
+#             print(answer)
+#             answer = ser.readline().decode()
+            
 
 
-
-
+   
+# for TEMP_VALUE in RANGE_TEMP:
+#     STRING_PIDsetpoint = f"setpoint_{TEMP_VALUE}"
+#     with serial.Serial(PORT_PID,baudrate=115200, timeout=1) as ser:
+#         print(f"Setting setpoint to {TEMP_VALUE}")
+#         ser.write(f"{STRING_PIDsetpoint}\n".encode())
+#         time.sleep(1)
+#         msg = ser.readline().decode()
+#         print(msg)
+#         while True:
+#             ser.write("query\n".encode())
+#             msg = ser.readline().decode()
+#             print(msg)
+#             if msg:
+#                 try:
+#                     setpoint = float(re.search("Setpoint: ([0-9]*.[0-9]*),",msg).group(1))
+#                     measured = float(re.search(".*Measured temp: ([0-9]*.[0-9]*).*",msg).group(1))
+#                     pwm = int(re.search(".*PID feedback: ([0-9]*.[0-9]*)",msg).group(1))
+#                     print("READING: ",setpoint,measured,pwm)
+#                     if abs(measured - setpoint) < 0.5:
+#                         print("READY to protocol")
+#                         break
+#                 except:
+#                     print(f"FAILED to read, value message: {msg}")
+#                     msg = ser.readline()
+#                     time.sleep(0.5)
+#             else:
+#                 print(f"UNPARSABLE messages: {msg}")
+#             time.sleep(0.5)
 
 
 
